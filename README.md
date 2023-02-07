@@ -24,7 +24,8 @@ The project is maintained as one monorepo containing the following packages:
 | `vite-plugin` | A plugin for Vite used for developing and bundling animations. |
 
 After cloning the repo, run `npm install` in the root of the project to install
-all necessary dependencies.
+all necessary dependencies, then run `npx lerna run build` to build each of the
+projects.
 
 ### Developing Core & 2D
 
