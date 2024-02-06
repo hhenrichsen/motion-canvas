@@ -5,7 +5,7 @@ import {
 import {addInitializer, initialize} from './initializers';
 import {capitalize, useLogger} from '@motion-canvas/core/lib/utils';
 import {patchSignal} from '../utils/patchSignal';
-import {SignalContext} from '@motion-canvas/core/lib/signals';
+import {SignalContext, SignalValue} from '@motion-canvas/core/lib/signals';
 
 export interface PropertyMetadata<T> {
   default?: T;
@@ -326,4 +326,14 @@ export function inspectable<T>(value = true): PropertyDecorator {
     }
     meta.inspectable = value;
   };
+}
+
+/**
+ * @returns The value of the signal or the given value.
+ */
+export function getConstantOrSignalValue<T>(value: T | SignalValue<T>): T {
+  if (value instanceof Function) {
+    return value();
+  }
+  return value;
 }

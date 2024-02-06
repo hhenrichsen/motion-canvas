@@ -1,4 +1,10 @@
-import {computed, initial, parser, signal} from '../decorators';
+import {
+  computed,
+  getConstantOrSignalValue,
+  initial,
+  parser,
+  signal,
+} from '../decorators';
 import {useLogger} from '@motion-canvas/core/lib/utils';
 import {Shape, ShapeProps} from './Shape';
 import {
@@ -23,6 +29,9 @@ import {threadable} from '@motion-canvas/core/lib/decorators';
 import {DesiredLength} from '../partials';
 import {SerializedVector2, Vector2} from '@motion-canvas/core/lib/types';
 import {
+  Computed,
+  createComputed,
+  createComputedAsync,
   createSignal,
   DependencyContext,
   Signal,
@@ -31,9 +40,15 @@ import {
 } from '@motion-canvas/core/lib/signals';
 import {join, ThreadGenerator} from '@motion-canvas/core/lib/threading';
 import {waitFor} from '@motion-canvas/core/lib/flow';
+import {
+  CodeRange,
+  CodePoint,
+  isPointInCodeRange,
+  lines,
+} from './code/CodeRange';
+import * as shiki from 'shiki';
 
-type CodePoint = [number, number];
-type CodeRange = [CodePoint, CodePoint];
+export * from './code/CodeRange';
 
 export interface CodeProps extends ShapeProps {
   language?: Lang;
@@ -47,6 +62,52 @@ export interface CodeProps extends ShapeProps {
 export interface CodeModification {
   from: string;
   to: string;
+}
+
+/**
+ * Code decorations are used to determine how we draw portions of text.
+ */
+export interface CodeDecoration {
+  /**
+   * The range that this decoration should affect.
+   */
+  range: CodeRange[] | SignalValue<CodeRange[]>;
+  /**
+   * If this decoration handles drawing the text itself. Multiple decorations with these
+   * are mutually exclusive.
+   */
+  needsToDrawText: boolean;
+  /**
+   * Text is drawn at 0;
+   * Anything that needs to manipulate the context or draw before text should be negative.
+   * Anything that needs to draw on top of text should be positive.
+   */
+  priority: number;
+
+  /**
+   * Draw the decoration on the text, or if needsToDrawText is set, draws the text.
+   */
+  draw(
+    node: CodeBlock,
+    position: Vector2,
+    progress: number,
+    char: string,
+    lineHeight: number,
+    width: number,
+    context: CanvasRenderingContext2D,
+  ): void;
+
+  /**
+   * Called on negative-priority decorations in inverse order once the text has been drawn.
+   */
+  cleanUp(
+    node: CodeBlock,
+    position: Vector2,
+    char: string,
+    lineHeight: number,
+    width: number,
+    context: CanvasRenderingContext2D,
+  ): void;
 }
 
 export class CodeBlock extends Shape {
@@ -110,6 +171,15 @@ export class CodeBlock extends Shape {
   @initial(lines(0, Infinity))
   @signal()
   public declare readonly selection: SimpleSignal<CodeRange[], this>;
+
+  @initial([])
+  @signal()
+  public declare readonly decoration: SimpleSignal<CodeDecoration[], this>;
+
+  public readonly sortedDecorations: Computed<CodeDecoration[]> =
+    createComputed(() => {
+      return this.decoration().sort((a, b) => a.priority - b.priority);
+    });
 
   protected *tweenSelection(
     value: CodeRange[],
@@ -362,18 +432,79 @@ export class CodeBlock extends Shape {
     const drawToken = (
       code: string,
       position: SerializedVector2,
-      alpha = 1,
+      progress = 1,
     ) => {
       for (let i = 0; i < code.length; i++) {
+        const decorations = this.sortedDecorations().filter(decoration =>
+          CodeBlock.isInRange(
+            getConstantOrSignalValue(decoration.range),
+            position.x,
+            position.y,
+          ),
+        );
+
+        const preDecorations = decorations.filter(
+          decoration =>
+            decoration &&
+            decoration.priority < 0 &&
+            !decoration.needsToDrawText,
+        );
+        const textDrawers = decorations.filter(
+          decoration =>
+            decoration &&
+            (decoration.priority == 0 || decoration.needsToDrawText),
+        );
+        const postDecorations = decorations.filter(
+          decoration =>
+            decoration &&
+            decoration.priority > 0 &&
+            !decoration.needsToDrawText,
+        );
+
+        if (textDrawers.length > 1) {
+          useLogger().warn(
+            'Multiple text-drawing decorations found; using the first.',
+          );
+        }
+
+        const textDrawer =
+          textDrawers?.[0]?.draw ??
+          ((
+            _: unknown,
+            position: Vector2,
+            progress: number,
+            char: string,
+            lineHeight: number,
+            width: number,
+            context: CanvasRenderingContext2D,
+          ) => {
+            context.globalAlpha = globalAlpha * progress;
+            context.fillText(char, position.x * width, position.y * lineHeight);
+          });
+
         const char = code.charAt(i);
         if (char === '\n') {
           position.y++;
           position.x = 0;
           continue;
         }
-        context.globalAlpha =
-          globalAlpha * alpha * getSelectionAlpha(position.x, position.y);
-        context.fillText(char, position.x * w, position.y * lh);
+
+        const charPosition = new Vector2(position);
+        preDecorations.forEach(decoration =>
+          decoration.draw(this, charPosition, progress, char, lh, w, context),
+        );
+
+        textDrawer(this, charPosition, progress, char, lh, w, context);
+
+        // TODO(hhenrichsen): Figure out if we should do this on postDecorations as well?
+        preDecorations.reverse();
+        preDecorations.forEach(decoration =>
+          decoration.cleanUp(this, charPosition, char, lh, w, context),
+        );
+
+        postDecorations.forEach(decoration =>
+          decoration.draw(this, charPosition, progress, char, lh, w, context),
+        );
         position.x++;
       }
     };
@@ -465,15 +596,20 @@ export class CodeBlock extends Shape {
     x: number,
     y: number,
   ): number {
-    return selection.length > 0 &&
-      !!selection.find(([[startLine, startColumn], [endLine, endColumn]]) => {
-        return (
-          ((y === startLine && x >= startColumn) || y > startLine) &&
-          ((y === endLine && x < endColumn) || y < endLine)
-        );
+    return CodeBlock.isInRange(selection, x, y) ? 1 : 0;
+  }
+
+  protected static isInRange(
+    range: CodeRange[],
+    x: number,
+    y: number,
+  ): boolean {
+    return (
+      range.length > 0 &&
+      range.some(range => {
+        return isPointInCodeRange([x, y], range);
       })
-      ? 1
-      : 0;
+    );
   }
 }
 
@@ -520,57 +656,46 @@ export function edit(from: string, to: string): CodeModification {
   return {from, to};
 }
 
-/**
- * Create a selection range that highlights the given lines.
- *
- * @param from - The line from which the selection starts.
- * @param to - The line at which the selection ends. If omitted, the selection
- *             will cover only one line.
- */
-export function lines(from: number, to?: number): CodeRange[] {
-  return [
-    [
-      [from, 0],
-      [to ?? from, Infinity],
-    ],
-  ];
-}
+// export class Emphasis implements CodeDecoration {
+//   public readonly highlightRange;
 
-/**
- * Create a selection range that highlights the given word.
- *
- * @param line - The line at which the word appears.
- * @param from - The column at which the word starts.
- * @param length - The length of the word. If omitted, the selection will cover
- *                 the rest of the line.
- */
-export function word(line: number, from: number, length?: number): CodeRange[] {
-  return [
-    [
-      [line, from],
-      [line, from + (length ?? Infinity)],
-    ],
-  ];
-}
+//   public constructor(highlightRange: CodeRange[] | SignalValue<CodeRange[]>) {
+//     this.highlightRange =
+//       highlightRange instanceof Function
+//         ? highlightRange
+//         : createSignal(highlightRange);
+//   }
 
-/**
- * Create a custom selection range.
- *
- * @param startLine - The line at which the selection starts.
- * @param startColumn - The column at which the selection starts.
- * @param endLine - The line at which the selection ends.
- * @param endColumn - The column at which the selection ends.
- */
-export function range(
-  startLine: number,
-  startColumn: number,
-  endLine: number,
-  endColumn: number,
-): CodeRange[] {
-  return [
-    [
-      [startLine, startColumn],
-      [endLine, endColumn],
-    ],
-  ];
-}
+//   public get range(): SignalValue<CodeRange[]> {
+//     const [[startLine, startColumn], [endLine, endColumn]] =
+//       this.highlightRange();
+//     // TODO: OH NO
+//     return [
+//       ...range(0, 0, startLine, startColumn),
+//       ...range(endLine, endColumn, Infinity, Infinity),
+//     ];
+//   }
+//   needsToDrawText: boolean;
+//   priority: number;
+//   draw(
+//     node: CodeBlock,
+//     position: Vector2,
+//     progress: number,
+//     char: string,
+//     lineHeight: number,
+//     width: number,
+//     context: CanvasRenderingContext2D,
+//   ): void {
+//     throw new Error('Method not implemented.');
+//   }
+//   cleanUp(
+//     node: CodeBlock,
+//     position: Vector2,
+//     char: string,
+//     lineHeight: number,
+//     width: number,
+//     context: CanvasRenderingContext2D,
+//   ): void {
+//     throw new Error('Method not implemented.');
+//   }
+// }
